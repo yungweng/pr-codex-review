@@ -21,7 +21,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: yungweng/homebrew-tap
-          token: ${{ secrets.TAP_GITHUB_TOKEN }}
+          ssh-key: ${{ secrets.TAP_DEPLOY_KEY }}
           path: tap
 
       - name: Update formula
