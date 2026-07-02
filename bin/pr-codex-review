@@ -1,0 +1,381 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage:
+  pr-codex-review <github-pr-url> [options]
+
+Options:
+  --runs N                 Number of Codex reviewer passes. Default: 6
+  --concurrency N          Reviewer passes to run at once. Default: 2
+  --base BRANCH            Base branch to review against. Default: PR base branch
+  --post                   Post the aggregated comment to the PR
+  --cleanup                Remove the temporary git worktree after the run
+  --resume-run DIR         Reuse an existing run directory and only aggregate/post
+  --allow-base-drift       Aggregate/post even if the base branch moved during review
+  --no-direnv              Skip direnv allow/exec
+  --allow-envrc-change     Allow automatic direnv allow even when .envrc changed
+  -h, --help               Show this help
+
+Examples:
+  pr-codex-review https://github.com/owner/repo/pull/123
+  pr-codex-review https://github.com/owner/repo/pull/123 --runs 8 --post
+EOF
+}
+
+die() {
+  echo "error: $*" >&2
+  exit 1
+}
+
+need() {
+  command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
+}
+
+PR_URL=""
+RUNS=6
+RUNS_SET=0
+CONCURRENCY=2
+BASE_BRANCH=""
+POST=0
+CLEANUP=0
+RESUME_RUN=""
+ALLOW_BASE_DRIFT=0
+USE_DIRENV=1
+ALLOW_ENVRC_CHANGE=0
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --runs)
+      RUNS="${2:-}"
+      RUNS_SET=1
+      shift 2
+      ;;
+    --runs=*)
+      RUNS="${1#*=}"
+      RUNS_SET=1
+      shift
+      ;;
+    --concurrency)
+      CONCURRENCY="${2:-}"
+      shift 2
+      ;;
+    --concurrency=*)
+      CONCURRENCY="${1#*=}"
+      shift
+      ;;
+    --base)
+      BASE_BRANCH="${2:-}"
+      shift 2
+      ;;
+    --base=*)
+      BASE_BRANCH="${1#*=}"
+      shift
+      ;;
+    --post)
+      POST=1
+      shift
+      ;;
+    --cleanup)
+      CLEANUP=1
+      shift
+      ;;
+    --resume-run)
+      RESUME_RUN="${2:-}"
+      shift 2
+      ;;
+    --resume-run=*)
+      RESUME_RUN="${1#*=}"
+      shift
+      ;;
+    --allow-base-drift)
+      ALLOW_BASE_DRIFT=1
+      shift
+      ;;
+    --no-direnv)
+      USE_DIRENV=0
+      shift
+      ;;
+    --allow-envrc-change)
+      ALLOW_ENVRC_CHANGE=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    -*)
+      die "unknown option: $1"
+      ;;
+    *)
+      if [ -n "$PR_URL" ]; then
+        die "only one PR URL is supported"
+      fi
+      PR_URL="$1"
+      shift
+      ;;
+  esac
+done
+
+[ -n "$PR_URL" ] || { usage; exit 1; }
+[[ "$RUNS" =~ ^[0-9]+$ ]] || die "--runs must be a number"
+[[ "$CONCURRENCY" =~ ^[0-9]+$ ]] || die "--concurrency must be a number"
+[ "$RUNS" -ge 1 ] || die "--runs must be >= 1"
+[ "$RUNS" -le 12 ] || die "--runs must be <= 12"
+[ "$CONCURRENCY" -ge 1 ] || die "--concurrency must be >= 1"
+
+need gh
+need git
+need jq
+need codex
+if [ "$USE_DIRENV" -eq 1 ]; then
+  need direnv
+fi
+
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || die "run from inside the target git repository"
+CURRENT_REPO="$(gh repo view --json nameWithOwner -q .nameWithOwner)"
+
+if [[ "$PR_URL" =~ ^https://github.com/([^/]+/[^/]+)/pull/([0-9]+) ]]; then
+  URL_REPO="${BASH_REMATCH[1]}"
+  URL_PR_NUMBER="${BASH_REMATCH[2]}"
+else
+  die "expected a GitHub PR URL like https://github.com/owner/repo/pull/123"
+fi
+
+[ "$URL_REPO" = "$CURRENT_REPO" ] || die "PR URL is for $URL_REPO, but current checkout is $CURRENT_REPO"
+
+META="$(gh pr view "$URL_PR_NUMBER" --json number,title,author,baseRefName,baseRefOid,headRefName,headRefOid,isDraft,url)"
+PR_NUMBER="$(jq -r '.number' <<<"$META")"
+PR_TITLE="$(jq -r '.title' <<<"$META")"
+AUTHOR_LOGIN="$(jq -r '.author.login' <<<"$META")"
+PR_BASE_BRANCH="$(jq -r '.baseRefName' <<<"$META")"
+INITIAL_BASE_SHA="$(jq -r '.baseRefOid' <<<"$META")"
+INITIAL_HEAD_SHA="$(jq -r '.headRefOid' <<<"$META")"
+IS_DRAFT="$(jq -r '.isDraft' <<<"$META")"
+
+if [ -z "$BASE_BRANCH" ]; then
+  BASE_BRANCH="$PR_BASE_BRANCH"
+elif [ "$PR_BASE_BRANCH" != "$BASE_BRANCH" ]; then
+  echo "warning: PR base is '$PR_BASE_BRANCH', but reviewing against '$BASE_BRANCH'" >&2
+fi
+
+RUN_ID="$(date +%Y%m%d-%H%M%S)"
+SAFE_REPO="${CURRENT_REPO//\//-}"
+BASE_REF="origin/$BASE_BRANCH"
+if [ -n "$RESUME_RUN" ]; then
+  RUN_ROOT="${RESUME_RUN%/}"
+else
+  RUN_ROOT="$HOME/.cache/pr-codex-review/$SAFE_REPO-pr-$PR_NUMBER-$RUN_ID"
+fi
+OUT_DIR="$RUN_ROOT/output"
+WORKTREE="$RUN_ROOT/worktree"
+mkdir -p "$OUT_DIR"
+
+echo "PR:       #$PR_NUMBER $PR_TITLE"
+echo "Author:   @$AUTHOR_LOGIN"
+echo "Repo:     $CURRENT_REPO"
+echo "Base:     $BASE_REF (GitHub reported $INITIAL_BASE_SHA)"
+echo "Head:     $INITIAL_HEAD_SHA"
+echo "Draft:    $IS_DRAFT"
+echo "Run dir:  $RUN_ROOT"
+
+cd "$REPO_ROOT"
+if [ -n "$RESUME_RUN" ]; then
+  [ -d "$OUT_DIR" ] || die "resume output directory does not exist: $OUT_DIR"
+  [ -e "$WORKTREE/.git" ] || die "resume worktree does not look like a git checkout: $WORKTREE"
+  if [ "$RUNS_SET" -eq 0 ]; then
+    RUNS="$(find "$OUT_DIR" -maxdepth 1 -type f -name 'reviewer-*.md' | awk '/\/reviewer-[0-9]+\.md$/ { count++ } END { print count + 0 }')"
+  fi
+  [ "$RUNS" -ge 1 ] || die "no reviewer outputs found in $OUT_DIR"
+  REVIEW_BASE_SHA="$(git -C "$WORKTREE" rev-parse "$BASE_REF")"
+  INITIAL_HEAD_SHA="$(git -C "$WORKTREE" rev-parse HEAD)"
+  echo "Resume:   using existing reviewer output"
+  echo "Worktree: $WORKTREE"
+  echo "Base reviewed: $REVIEW_BASE_SHA"
+  echo "Head reviewed: $INITIAL_HEAD_SHA"
+else
+  git fetch origin "+refs/heads/$BASE_BRANCH:refs/remotes/origin/$BASE_BRANCH"
+  REVIEW_BASE_SHA="$(git rev-parse "$BASE_REF")"
+  echo "Fetched base: $REVIEW_BASE_SHA"
+  git fetch origin "+pull/$PR_NUMBER/head:refs/pr-codex-review/$PR_NUMBER"
+  FETCHED_HEAD_SHA="$(git rev-parse "refs/pr-codex-review/$PR_NUMBER")"
+  [ "$FETCHED_HEAD_SHA" = "$INITIAL_HEAD_SHA" ] || die "fetched PR head $FETCHED_HEAD_SHA differs from GitHub metadata $INITIAL_HEAD_SHA"
+
+  git worktree add --detach "$WORKTREE" "$FETCHED_HEAD_SHA" >/dev/null
+  echo "Worktree: $WORKTREE"
+fi
+
+cleanup() {
+  if [ "$CLEANUP" -eq 1 ] && [ -d "$WORKTREE" ]; then
+    git -C "$REPO_ROOT" worktree remove "$WORKTREE" --force >/dev/null 2>&1 || true
+  fi
+}
+trap cleanup EXIT
+
+if [ "$USE_DIRENV" -eq 1 ] && find "$WORKTREE" -name .envrc -print -quit | grep -q .; then
+  ENVRC_DIFF="$(git -C "$WORKTREE" diff --name-only "$BASE_REF"...HEAD -- .envrc ':(glob)**/.envrc' || true)"
+  if [ -n "$ENVRC_DIFF" ] && [ "$ALLOW_ENVRC_CHANGE" -ne 1 ]; then
+    echo "Refusing automatic direnv allow because this PR changes:" >&2
+    echo "$ENVRC_DIFF" >&2
+    echo "Review the .envrc change manually, then rerun with --allow-envrc-change if it is safe." >&2
+    exit 2
+  fi
+  (cd "$WORKTREE" && direnv allow)
+  echo "direnv:   allowed"
+fi
+
+review_prompt() {
+  case "$1" in
+    1) echo "Review this PR against $BASE_REF for correctness regressions, broken assumptions, and production bugs. Findings first. Only report issues grounded in the diff." ;;
+    2) echo "Review this PR against $BASE_REF for security, authorization, privacy/PII exposure, multi-tenant isolation, and unsafe trust boundaries. Findings first. Only report issues grounded in the diff." ;;
+    3) echo "Review this PR against $BASE_REF for backend architecture, transactions, data-access boundaries, migrations, and error contracts. Findings first. Only report issues grounded in the diff." ;;
+    4) echo "Review this PR against $BASE_REF for frontend correctness, route behavior, environment validation, type mapping, state handling, and UI regressions. Findings first. Only report issues grounded in the diff." ;;
+    5) echo "Review this PR against $BASE_REF for missing tests, weak tests, migration safety, date/time modeling, and edge cases. Findings first. Only report issues grounded in the diff." ;;
+    6) echo "Review this PR against $BASE_REF for error handling, observability, concurrency, performance, and operational risk. Findings first. Only report issues grounded in the diff." ;;
+    7) echo "Review this PR against $BASE_REF for cross-repo contracts, API compatibility, hardcoded strings, integration breakage, and backwards compatibility. Findings first. Only report issues grounded in the diff." ;;
+    *) echo "Contrarian review of this PR against $BASE_REF: try to prove this should not merge. Challenge assumptions, simplify suspicious complexity, and report only grounded findings." ;;
+  esac
+}
+
+run_reviewer() {
+  local idx="$1"
+  local out="$OUT_DIR/reviewer-$idx.md"
+  local log="$OUT_DIR/reviewer-$idx.log"
+  local focus="$OUT_DIR/reviewer-$idx.focus.md"
+  local prompt
+  prompt="$(review_prompt "$idx")"
+  printf '%s\n' "$prompt" > "$focus"
+  echo "reviewer-$idx: start"
+  if [ "$USE_DIRENV" -eq 1 ]; then
+    (cd "$WORKTREE" && direnv exec "$WORKTREE" codex exec review --base "$BASE_REF" --ephemeral -o "$out") >"$log" 2>&1
+  else
+    (cd "$WORKTREE" && codex exec review --base "$BASE_REF" --ephemeral -o "$out") >"$log" 2>&1
+  fi
+  echo "reviewer-$idx: done -> $out"
+}
+
+if [ -z "$RESUME_RUN" ]; then
+  FAILED=0
+  batch=()
+  for idx in $(seq 1 "$RUNS"); do
+    run_reviewer "$idx" &
+    batch+=("$!")
+    if [ "${#batch[@]}" -ge "$CONCURRENCY" ]; then
+      for pid in "${batch[@]}"; do
+        wait "$pid" || FAILED=1
+      done
+      batch=()
+    fi
+  done
+  for pid in "${batch[@]}"; do
+    wait "$pid" || FAILED=1
+  done
+
+  if [ "$FAILED" -ne 0 ]; then
+    echo "One or more reviewer runs failed. Check logs in $OUT_DIR." >&2
+    exit 1
+  fi
+fi
+
+LATEST_BASE_SHA="$(git ls-remote origin "refs/heads/$BASE_BRANCH" | awk '{print $1}')"
+LATEST_HEAD_SHA="$(git ls-remote origin "refs/pull/$PR_NUMBER/head" | awk '{print $1}')"
+[ -n "$LATEST_BASE_SHA" ] || die "could not resolve remote base ref refs/heads/$BASE_BRANCH"
+[ -n "$LATEST_HEAD_SHA" ] || die "could not resolve remote PR ref refs/pull/$PR_NUMBER/head"
+BASE_DRIFT_NOTE=""
+if [ "$LATEST_HEAD_SHA" != "$INITIAL_HEAD_SHA" ]; then
+  echo "PR head changed during review; refusing to aggregate/post stale findings." >&2
+  echo "Reviewed base/head: $REVIEW_BASE_SHA / $INITIAL_HEAD_SHA" >&2
+  echo "Latest  base/head: $LATEST_BASE_SHA / $LATEST_HEAD_SHA" >&2
+  exit 3
+fi
+if [ "$LATEST_BASE_SHA" != "$REVIEW_BASE_SHA" ]; then
+  if [ "$ALLOW_BASE_DRIFT" -ne 1 ]; then
+    echo "Base branch changed during review; refusing to aggregate/post stale findings." >&2
+    echo "Reviewed base/head: $REVIEW_BASE_SHA / $INITIAL_HEAD_SHA" >&2
+    echo "Latest  base/head: $LATEST_BASE_SHA / $LATEST_HEAD_SHA" >&2
+    echo "Re-run, or use --resume-run with --allow-base-drift if the base movement is safe to ignore." >&2
+    exit 3
+  fi
+  BASE_DRIFT_NOTE="Base branch moved after review: reviewed $REVIEW_BASE_SHA, latest $LATEST_BASE_SHA. The PR head stayed the same."
+  echo "warning: $BASE_DRIFT_NOTE" >&2
+fi
+
+ALL_REVIEWERS="$OUT_DIR/all-reviewers.md"
+FINAL_COMMENT="$OUT_DIR/final-pr-comment.md"
+{
+  echo "# Reviewer Outputs"
+  echo
+  for idx in $(seq 1 "$RUNS"); do
+    echo "## Reviewer $idx"
+    echo
+    echo "Focus used by the local runner:"
+    echo
+    if [ -f "$OUT_DIR/reviewer-$idx.focus.md" ]; then
+      cat "$OUT_DIR/reviewer-$idx.focus.md"
+    else
+      echo "No focus file recorded."
+    fi
+    echo
+    echo "Review output:"
+    echo
+    [ -f "$OUT_DIR/reviewer-$idx.md" ] || die "missing reviewer output: $OUT_DIR/reviewer-$idx.md"
+    cat "$OUT_DIR/reviewer-$idx.md"
+    echo
+  done
+} > "$ALL_REVIEWERS"
+
+AGG_PROMPT="$(cat <<EOF
+Write the exact Markdown body for a GitHub PR comment and tag the creator of the PR directly. Be nice. Aggregate these findings and use them as input for the PR review.
+
+Important execution rules:
+- Do not post the comment.
+- Do not run gh, git, curl, xh, or any other command.
+- Do not use tools.
+- Return only the Markdown comment body.
+- Do not wrap the answer in a code fence.
+
+PR: $PR_URL
+Title: $PR_TITLE
+Author: @$AUTHOR_LOGIN
+Base: $BASE_REF
+Base SHA reviewed: $REVIEW_BASE_SHA
+Head SHA: $INITIAL_HEAD_SHA
+Base drift note: ${BASE_DRIFT_NOTE:-none}
+
+Rules:
+- Address @$AUTHOR_LOGIN directly near the top.
+- Be friendly, but do not dilute real issues.
+- Deduplicate overlapping findings.
+- Do not invent findings that are not present in the reviewer outputs.
+- Keep only findings grounded in reviewer evidence.
+- Prefer this structure: Summary, Blockers, Critical, Suggestions, Questions.
+- If there are no blockers or critical issues, say that clearly.
+- Do not mention internal reviewer count, Codex sessions, or automation details.
+- Keep the comment concise enough for a GitHub PR discussion.
+EOF
+)"
+
+if [ "$USE_DIRENV" -eq 1 ]; then
+  (cd "$WORKTREE" && direnv exec "$WORKTREE" codex exec --sandbox read-only --ephemeral -o "$FINAL_COMMENT" "$AGG_PROMPT" < "$ALL_REVIEWERS") >"$OUT_DIR/aggregator.log" 2>&1
+else
+  (cd "$WORKTREE" && codex exec --sandbox read-only --ephemeral -o "$FINAL_COMMENT" "$AGG_PROMPT" < "$ALL_REVIEWERS") >"$OUT_DIR/aggregator.log" 2>&1
+fi
+
+if head -n 1 "$FINAL_COMMENT" | grep -Eq '^```'; then
+  echo "Aggregator wrapped the comment in a code fence; refusing to post. See $FINAL_COMMENT" >&2
+  exit 4
+fi
+if grep -Eiq 'I tried to post|gh pr comment|api\.github\.com|exact comment I prepared' "$FINAL_COMMENT"; then
+  echo "Aggregator produced meta-output instead of a PR comment; refusing to post. See $FINAL_COMMENT" >&2
+  exit 4
+fi
+
+echo "Final comment: $FINAL_COMMENT"
+
+if [ "$POST" -eq 1 ]; then
+  gh pr comment "$URL_PR_NUMBER" --body-file "$FINAL_COMMENT"
+  echo "Posted comment to PR #$PR_NUMBER."
+else
+  echo "Dry run complete. Re-run with --post to comment on the PR."
+fi
