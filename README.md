@@ -44,6 +44,7 @@ Use this when you want 6 reviewers in parallel and want the final comment posted
 pr-codex-review https://github.com/owner/repo/pull/123 \
   --runs 6 \
   --concurrency 6 \
+  --min-successful 5 \
   --allow-base-drift \
   --post
 ```
@@ -81,6 +82,15 @@ Post the aggregated comment to the PR. Without this, it only writes files.
 Allow aggregation/posting if only the base branch moved during review.
 The PR head must still match the reviewed commit.
 
+--review-timeout DURATION
+Kill a reviewer that runs too long. Default: 45m.
+Use `0` to disable. Supports values like `30m`, `45m`, `1h`, or raw seconds.
+
+--min-successful N
+Minimum reviewer outputs required to aggregate/post.
+Default: all requested runs.
+Use `--runs 6 --min-successful 5` to tolerate one failed or timed-out reviewer.
+
 --resume-run DIR
 Reuse an existing run directory and only aggregate/post.
 Use this when reviewer runs finished but aggregation or posting stopped.
@@ -111,6 +121,16 @@ pr-codex-review https://github.com/owner/repo/pull/123 \
 ```
 
 This does not rerun the expensive reviewer passes.
+
+If one reviewer failed or timed out but enough reviewer outputs exist:
+
+```bash
+pr-codex-review https://github.com/owner/repo/pull/123 \
+  --resume-run ~/.cache/pr-codex-review/owner-repo-pr-123-YYYYMMDD-HHMMSS \
+  --min-successful 5 \
+  --allow-base-drift \
+  --post
+```
 
 ## Safety Stops
 
@@ -151,17 +171,17 @@ glow "$RUN/output/final-pr-comment.md"
 Dry run:
 
 ```bash
-pr-codex-review <PR_URL> --runs 6 --concurrency 6 --allow-base-drift
+pr-codex-review <PR_URL> --runs 6 --concurrency 6 --min-successful 5 --allow-base-drift
 ```
 
 Post:
 
 ```bash
-pr-codex-review <PR_URL> --runs 6 --concurrency 6 --allow-base-drift --post
+pr-codex-review <PR_URL> --runs 6 --concurrency 6 --min-successful 5 --allow-base-drift --post
 ```
 
 Resume and post:
 
 ```bash
-pr-codex-review <PR_URL> --resume-run <RUN_DIR> --allow-base-drift --post
+pr-codex-review <PR_URL> --resume-run <RUN_DIR> --min-successful 5 --allow-base-drift --post
 ```

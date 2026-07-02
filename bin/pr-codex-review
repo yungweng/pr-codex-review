@@ -14,6 +14,10 @@ Options:
   --cleanup                Remove the temporary git worktree after the run
   --resume-run DIR         Reuse an existing run directory and only aggregate/post
   --allow-base-drift       Aggregate/post even if the base branch moved during review
+  --review-timeout DURATION
+                           Kill a reviewer that runs too long. Default: 45m
+  --min-successful N       Minimum reviewer outputs required to aggregate/post.
+                           Default: all requested runs
   --no-direnv              Skip direnv allow/exec
   --allow-envrc-change     Allow automatic direnv allow even when .envrc changed
   -h, --help               Show this help
@@ -44,6 +48,8 @@ RESUME_RUN=""
 ALLOW_BASE_DRIFT=0
 USE_DIRENV=1
 ALLOW_ENVRC_CHANGE=0
+REVIEW_TIMEOUT="45m"
+MIN_SUCCESSFUL=""
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -93,6 +99,22 @@ while [ "$#" -gt 0 ]; do
       ALLOW_BASE_DRIFT=1
       shift
       ;;
+    --review-timeout)
+      REVIEW_TIMEOUT="${2:-}"
+      shift 2
+      ;;
+    --review-timeout=*)
+      REVIEW_TIMEOUT="${1#*=}"
+      shift
+      ;;
+    --min-successful)
+      MIN_SUCCESSFUL="${2:-}"
+      shift 2
+      ;;
+    --min-successful=*)
+      MIN_SUCCESSFUL="${1#*=}"
+      shift
+      ;;
     --no-direnv)
       USE_DIRENV=0
       shift
@@ -121,9 +143,28 @@ done
 [ -n "$PR_URL" ] || { usage; exit 1; }
 [[ "$RUNS" =~ ^[0-9]+$ ]] || die "--runs must be a number"
 [[ "$CONCURRENCY" =~ ^[0-9]+$ ]] || die "--concurrency must be a number"
+[ -z "$MIN_SUCCESSFUL" ] || [[ "$MIN_SUCCESSFUL" =~ ^[0-9]+$ ]] || die "--min-successful must be a number"
 [ "$RUNS" -ge 1 ] || die "--runs must be >= 1"
 [ "$RUNS" -le 12 ] || die "--runs must be <= 12"
 [ "$CONCURRENCY" -ge 1 ] || die "--concurrency must be >= 1"
+[ -z "$MIN_SUCCESSFUL" ] || [ "$MIN_SUCCESSFUL" -ge 1 ] || die "--min-successful must be >= 1"
+
+duration_to_seconds() {
+  local value="$1"
+  if [[ "$value" =~ ^[0-9]+$ ]]; then
+    echo "$value"
+  elif [[ "$value" =~ ^([0-9]+)s$ ]]; then
+    echo "${BASH_REMATCH[1]}"
+  elif [[ "$value" =~ ^([0-9]+)m$ ]]; then
+    echo "$((BASH_REMATCH[1] * 60))"
+  elif [[ "$value" =~ ^([0-9]+)h$ ]]; then
+    echo "$((BASH_REMATCH[1] * 3600))"
+  else
+    die "--review-timeout must be seconds or a duration like 30m, 45m, 1h, or 0"
+  fi
+}
+
+REVIEW_TIMEOUT_SECONDS="$(duration_to_seconds "$REVIEW_TIMEOUT")"
 
 need gh
 need git
@@ -247,12 +288,83 @@ run_reviewer() {
   prompt="$(review_prompt "$idx")"
   printf '%s\n' "$prompt" > "$focus"
   echo "reviewer-$idx: start"
-  if [ "$USE_DIRENV" -eq 1 ]; then
-    (cd "$WORKTREE" && direnv exec "$WORKTREE" codex exec review --base "$BASE_REF" --ephemeral -o "$out") >"$log" 2>&1
+  if run_with_timeout "$REVIEW_TIMEOUT_SECONDS" "$REVIEW_TIMEOUT" run_codex_review "$out" >"$log" 2>&1; then
+    echo "reviewer-$idx: done -> $out"
   else
-    (cd "$WORKTREE" && codex exec review --base "$BASE_REF" --ephemeral -o "$out") >"$log" 2>&1
+    local rc=$?
+    rm -f "$out"
+    echo "reviewer-$idx: failed with exit $rc -> $log" >&2
+    return "$rc"
   fi
-  echo "reviewer-$idx: done -> $out"
+}
+
+run_codex_review() {
+  local out="$1"
+  if [ "$USE_DIRENV" -eq 1 ]; then
+    (cd "$WORKTREE" && direnv exec "$WORKTREE" codex exec review --base "$BASE_REF" --ephemeral -o "$out")
+  else
+    (cd "$WORKTREE" && codex exec review --base "$BASE_REF" --ephemeral -o "$out")
+  fi
+}
+
+child_pids() {
+  local pid="$1"
+  ps -axo pid=,ppid= | awk -v p="$pid" '$2 == p { print $1 }'
+}
+
+kill_tree() {
+  local pid="$1"
+  local children child
+  children="$(child_pids "$pid" || true)"
+  for child in $children; do
+    kill_tree "$child"
+  done
+  kill -TERM "$pid" 2>/dev/null || true
+}
+
+force_kill_tree() {
+  local pid="$1"
+  local children child
+  children="$(child_pids "$pid" || true)"
+  for child in $children; do
+    force_kill_tree "$child"
+  done
+  kill -KILL "$pid" 2>/dev/null || true
+}
+
+run_with_timeout() {
+  local seconds="$1"
+  local label="$2"
+  shift 2
+  if [ "$seconds" -eq 0 ]; then
+    "$@"
+    return
+  fi
+
+  "$@" &
+  local child="$!"
+  local elapsed=0
+  while kill -0 "$child" 2>/dev/null; do
+    if [ "$elapsed" -ge "$seconds" ]; then
+      echo "error: reviewer timed out after $label; terminating process tree rooted at $child" >&2
+      kill_tree "$child"
+      sleep 2
+      if kill -0 "$child" 2>/dev/null; then
+        force_kill_tree "$child"
+      fi
+      wait "$child" 2>/dev/null || true
+      return 124
+    fi
+    sleep 5
+    elapsed=$((elapsed + 5))
+  done
+  wait "$child"
+}
+
+reviewer_indices() {
+  find "$OUT_DIR" -maxdepth 1 -type f -name 'reviewer-*.md' \
+    | sed -nE 's#.*/reviewer-([0-9]+)\.md$#\1#p' \
+    | sort -n
 }
 
 if [ -z "$RESUME_RUN" ]; then
@@ -272,10 +384,27 @@ if [ -z "$RESUME_RUN" ]; then
     wait "$pid" || FAILED=1
   done
 
-  if [ "$FAILED" -ne 0 ]; then
-    echo "One or more reviewer runs failed. Check logs in $OUT_DIR." >&2
-    exit 1
+fi
+
+REVIEWER_INDICES=()
+while IFS= read -r idx; do
+  REVIEWER_INDICES+=("$idx")
+done < <(reviewer_indices)
+SUCCESSFUL_REVIEWS="${#REVIEWER_INDICES[@]}"
+if [ -z "$MIN_SUCCESSFUL" ]; then
+  if [ -n "$RESUME_RUN" ]; then
+    MIN_SUCCESSFUL="$SUCCESSFUL_REVIEWS"
+  else
+    MIN_SUCCESSFUL="$RUNS"
   fi
+fi
+if [ "$SUCCESSFUL_REVIEWS" -lt "$MIN_SUCCESSFUL" ]; then
+  echo "Only $SUCCESSFUL_REVIEWS reviewer output(s) available; need $MIN_SUCCESSFUL." >&2
+  echo "Check logs in $OUT_DIR." >&2
+  exit 1
+fi
+if [ "${FAILED:-0}" -ne 0 ]; then
+  echo "warning: one or more reviewers failed; continuing with $SUCCESSFUL_REVIEWS reviewer output(s)." >&2
 fi
 
 LATEST_BASE_SHA="$(git ls-remote origin "refs/heads/$BASE_BRANCH" | awk '{print $1}')"
@@ -306,7 +435,7 @@ FINAL_COMMENT="$OUT_DIR/final-pr-comment.md"
 {
   echo "# Reviewer Outputs"
   echo
-  for idx in $(seq 1 "$RUNS"); do
+  for idx in "${REVIEWER_INDICES[@]}"; do
     echo "## Reviewer $idx"
     echo
     echo "Focus used by the local runner:"
