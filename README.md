@@ -6,7 +6,21 @@ This is a local wrapper around `gh`, `git worktree`, `direnv`, and `codex exec r
 
 ## Install
 
-From this repo:
+Via Homebrew:
+
+```bash
+brew tap yungweng/tap
+brew trust yungweng/tap
+brew install pr-codex-review
+```
+
+This pulls in `gh`, `jq`, and `direnv` automatically. The Codex CLI must be installed separately:
+
+```bash
+brew install --cask codex
+```
+
+Or manually from this repo:
 
 ```bash
 ln -sf "$PWD/bin/pr-codex-review" ~/.local/bin/pr-codex-review
