@@ -109,6 +109,9 @@ Skip direnv.
 Allow automatic direnv allow even when the PR changed `.envrc`.
 Use this only after manually checking the `.envrc` diff.
 
+--version
+Show version.
+
 -h, --help
 Show command help.
 ```
@@ -147,7 +150,7 @@ Each run writes files under:
 ~/.cache/pr-codex-review/<repo>-pr-<number>-<timestamp>/output/
 ```
 
-The `output/` directory always survives; only the `worktree/` directory is removed after a successful run (keep it with `--keep-worktree`).
+The `output/` directory always survives; only the `worktree/` directory is removed after a successful run (keep it with `--keep-worktree`). Run directories older than 7 days are deleted automatically at the start of the next run.
 
 Useful files:
 

@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+VERSION="1.0.1"
+
 usage() {
   cat <<'EOF'
 Usage:
@@ -19,6 +21,7 @@ Options:
                            Default: majority of the requested runs
   --no-direnv              Skip direnv allow/exec
   --allow-envrc-change     Allow automatic direnv allow even when .envrc changed
+  --version                Show version
   -h, --help               Show this help
 
 Deprecated no-ops (now the default behavior):
@@ -123,6 +126,10 @@ while [ "$#" -gt 0 ]; do
     --allow-envrc-change)
       ALLOW_ENVRC_CHANGE=1
       shift
+      ;;
+    --version)
+      echo "pr-codex-review $VERSION"
+      exit 0
       ;;
     -h|--help)
       usage
@@ -232,6 +239,17 @@ OUT_DIR="$RUN_ROOT/output"
 WORKTREE="$RUN_ROOT/worktree"
 mkdir -p "$OUT_DIR"
 
+GC_REMOVED=0
+while IFS= read -r old_dir; do
+  [ "$old_dir" = "$RUN_ROOT" ] && continue
+  rm -rf "$old_dir"
+  GC_REMOVED=$((GC_REMOVED + 1))
+done < <(find "$HOME/.cache/pr-codex-review" -mindepth 1 -maxdepth 1 -type d -mtime +7 2>/dev/null)
+git -C "$REPO_ROOT" worktree prune >/dev/null 2>&1 || true
+if [ "$GC_REMOVED" -gt 0 ]; then
+  echo "${C_DIM}gc: removed $GC_REMOVED old run dir(s)${C_RESET}"
+fi
+
 echo "${C_BOLD}PR:       #$PR_NUMBER $PR_TITLE${C_RESET}"
 echo "Author:   @$AUTHOR_LOGIN"
 echo "Repo:     $CURRENT_REPO"
@@ -287,19 +305,6 @@ if [ "$USE_DIRENV" -eq 1 ] && find "$WORKTREE" -name .envrc -print -quit | grep 
   echo "direnv:   allowed"
 fi
 
-review_prompt() {
-  case "$1" in
-    1) echo "Review this PR against $BASE_REF for correctness regressions, broken assumptions, and production bugs. Findings first. Only report issues grounded in the diff." ;;
-    2) echo "Review this PR against $BASE_REF for security, authorization, privacy/PII exposure, multi-tenant isolation, and unsafe trust boundaries. Findings first. Only report issues grounded in the diff." ;;
-    3) echo "Review this PR against $BASE_REF for backend architecture, transactions, data-access boundaries, migrations, and error contracts. Findings first. Only report issues grounded in the diff." ;;
-    4) echo "Review this PR against $BASE_REF for frontend correctness, route behavior, environment validation, type mapping, state handling, and UI regressions. Findings first. Only report issues grounded in the diff." ;;
-    5) echo "Review this PR against $BASE_REF for missing tests, weak tests, migration safety, date/time modeling, and edge cases. Findings first. Only report issues grounded in the diff." ;;
-    6) echo "Review this PR against $BASE_REF for error handling, observability, concurrency, performance, and operational risk. Findings first. Only report issues grounded in the diff." ;;
-    7) echo "Review this PR against $BASE_REF for cross-repo contracts, API compatibility, hardcoded strings, integration breakage, and backwards compatibility. Findings first. Only report issues grounded in the diff." ;;
-    *) echo "Contrarian review of this PR against $BASE_REF: try to prove this should not merge. Challenge assumptions, simplify suspicious complexity, and report only grounded findings." ;;
-  esac
-}
-
 format_duration() {
   local total="$1"
   printf '%dm%02ds' "$((total / 60))" "$((total % 60))"
@@ -309,16 +314,18 @@ run_reviewer() {
   local idx="$1"
   local out="$OUT_DIR/reviewer-$idx.md"
   local log="$OUT_DIR/reviewer-$idx.log"
-  local focus="$OUT_DIR/reviewer-$idx.focus.md"
-  local prompt started elapsed done_count
-  prompt="$(review_prompt "$idx")"
-  printf '%s\n' "$prompt" > "$focus"
+  local started elapsed rank
   echo "${C_DIM}reviewer-$idx: start${C_RESET}"
   started="$(date +%s)"
   if run_with_timeout "$REVIEW_TIMEOUT_SECONDS" "$REVIEW_TIMEOUT" run_codex_review "$out" >"$log" 2>&1; then
     elapsed="$(( $(date +%s) - started ))"
-    done_count="$(reviewer_indices | wc -l | tr -d ' ')"
-    echo "${C_GREEN}reviewer-$idx: done in $(format_duration "$elapsed") [$done_count/$RUNS]${C_RESET}"
+    # Claim the lowest free rank atomically; counting output files races
+    # when two reviewers finish at the same moment.
+    rank=1
+    while ! mkdir "$OUT_DIR/.done-$rank" 2>/dev/null; do
+      rank=$((rank + 1))
+    done
+    echo "${C_GREEN}reviewer-$idx: done in $(format_duration "$elapsed") [$rank/$RUNS]${C_RESET}"
   else
     local rc=$?
     rm -f "$out"
@@ -460,16 +467,6 @@ FINAL_COMMENT="$OUT_DIR/final-pr-comment.md"
   for idx in "${REVIEWER_INDICES[@]}"; do
     echo "## Reviewer $idx"
     echo
-    echo "Focus used by the local runner:"
-    echo
-    if [ -f "$OUT_DIR/reviewer-$idx.focus.md" ]; then
-      cat "$OUT_DIR/reviewer-$idx.focus.md"
-    else
-      echo "No focus file recorded."
-    fi
-    echo
-    echo "Review output:"
-    echo
     [ -f "$OUT_DIR/reviewer-$idx.md" ] || die "missing reviewer output: $OUT_DIR/reviewer-$idx.md"
     cat "$OUT_DIR/reviewer-$idx.md"
     echo
@@ -507,19 +504,39 @@ Rules:
 EOF
 )"
 
-echo "${C_DIM}aggregator: combining $SUCCESSFUL_REVIEWS reviewer output(s)...${C_RESET}"
-if [ "$USE_DIRENV" -eq 1 ]; then
-  (cd "$WORKTREE" && direnv exec "$WORKTREE" codex exec --sandbox read-only --ephemeral -o "$FINAL_COMMENT" "$AGG_PROMPT" < "$ALL_REVIEWERS") >"$OUT_DIR/aggregator.log" 2>&1
-else
-  (cd "$WORKTREE" && codex exec --sandbox read-only --ephemeral -o "$FINAL_COMMENT" "$AGG_PROMPT" < "$ALL_REVIEWERS") >"$OUT_DIR/aggregator.log" 2>&1
-fi
+run_aggregator() {
+  if [ "$USE_DIRENV" -eq 1 ]; then
+    (cd "$WORKTREE" && direnv exec "$WORKTREE" codex exec --sandbox read-only --ephemeral -o "$FINAL_COMMENT" "$AGG_PROMPT" < "$ALL_REVIEWERS") >"$OUT_DIR/aggregator.log" 2>&1
+  else
+    (cd "$WORKTREE" && codex exec --sandbox read-only --ephemeral -o "$FINAL_COMMENT" "$AGG_PROMPT" < "$ALL_REVIEWERS") >"$OUT_DIR/aggregator.log" 2>&1
+  fi
+}
 
-if head -n 1 "$FINAL_COMMENT" | grep -Eq '^```'; then
-  echo "Aggregator wrapped the comment in a code fence; refusing to post. See $FINAL_COMMENT" >&2
-  exit 4
-fi
-if grep -Eiq 'I tried to post|gh pr comment|api\.github\.com|exact comment I prepared' "$FINAL_COMMENT"; then
-  echo "Aggregator produced meta-output instead of a PR comment; refusing to post. See $FINAL_COMMENT" >&2
+aggregator_output_valid() {
+  if head -n 1 "$FINAL_COMMENT" | grep -Eq '^```'; then
+    echo "Aggregator wrapped the comment in a code fence." >&2
+    return 1
+  fi
+  if grep -Eiq 'I tried to post|gh pr comment|api\.github\.com|exact comment I prepared' "$FINAL_COMMENT"; then
+    echo "Aggregator produced meta-output instead of a PR comment." >&2
+    return 1
+  fi
+}
+
+echo "${C_DIM}aggregator: combining $SUCCESSFUL_REVIEWS reviewer output(s)...${C_RESET}"
+AGG_OK=0
+for attempt in 1 2; do
+  run_aggregator
+  if aggregator_output_valid; then
+    AGG_OK=1
+    break
+  fi
+  if [ "$attempt" -eq 1 ]; then
+    echo "aggregator: attempt 1 produced invalid output, retrying..." >&2
+  fi
+done
+if [ "$AGG_OK" -ne 1 ]; then
+  echo "Aggregator output still invalid after 2 attempts; refusing to post. See $FINAL_COMMENT" >&2
   exit 4
 fi
 

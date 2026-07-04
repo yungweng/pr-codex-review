@@ -33,9 +33,10 @@ bin/pr-codex-review --help
 
 Distribution is a Homebrew tap (`yungweng/homebrew-tap`). The formula there is updated automatically; never edit it by hand for a version bump.
 
-1. Commit and push to `main`.
-2. `git tag vX.Y.Z && git push origin vX.Y.Z`
-3. `gh release create vX.Y.Z --title "vX.Y.Z" --notes "..."`
+1. Set `VERSION` at the top of `bin/pr-codex-review` to the new version (otherwise `--version` lies).
+2. Commit and push to `main`.
+3. `git tag vX.Y.Z && git push origin vX.Y.Z`
+4. `gh release create vX.Y.Z --title "vX.Y.Z" --notes "..."`
 
 Publishing the release (not the tag) triggers `update-homebrew-tap.yml`, which recomputes the tarball SHA and pushes the bumped formula to the tap using the `TAP_DEPLOY_KEY` secret (a write deploy key on the tap repo).
 
