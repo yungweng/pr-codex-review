@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="1.0.1"
+VERSION="1.1.0"
+SCRIPT_STARTED="$(date +%s)"
 
 usage() {
   cat <<'EOF'
@@ -9,8 +10,12 @@ Usage:
   pr-codex-review <pr-number|github-pr-url> [options]
 
 Options:
-  --runs N                 Number of Codex reviewer passes. Default: 6
-  --concurrency N          Reviewer passes to run at once. Default: same as --runs
+  -n, --runs N             Number of Codex reviewer passes. Default: 6
+  --concurrency N          Max reviewer passes running at once. Default: same as --runs
+  --model MODEL            Model for the Codex reviewers and aggregator.
+                           Default: your codex default
+  --effort LEVEL           Reasoning effort: minimal, low, medium, high, xhigh.
+                           Default: your codex default
   --base BRANCH            Base branch to review against. Default: PR base branch
   --dry-run                Write the aggregated comment to disk without posting it
   --keep-worktree          Keep the temporary git worktree after a successful run
@@ -29,7 +34,8 @@ Deprecated no-ops (now the default behavior):
 
 Examples:
   pr-codex-review 123
-  pr-codex-review https://github.com/owner/repo/pull/123 --runs 8 --dry-run
+  pr-codex-review 123 -n 8 --model gpt-5.5 --effort high
+  pr-codex-review https://github.com/owner/repo/pull/123 --dry-run
 EOF
 }
 
@@ -54,10 +60,12 @@ USE_DIRENV=1
 ALLOW_ENVRC_CHANGE=0
 REVIEW_TIMEOUT="45m"
 MIN_SUCCESSFUL=""
+MODEL=""
+EFFORT=""
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --runs)
+    -n|--runs)
       RUNS="${2:-}"
       RUNS_SET=1
       shift 2
@@ -73,6 +81,22 @@ while [ "$#" -gt 0 ]; do
       ;;
     --concurrency=*)
       CONCURRENCY="${1#*=}"
+      shift
+      ;;
+    --model)
+      MODEL="${2:-}"
+      shift 2
+      ;;
+    --model=*)
+      MODEL="${1#*=}"
+      shift
+      ;;
+    --effort)
+      EFFORT="${2:-}"
+      shift 2
+      ;;
+    --effort=*)
+      EFFORT="${1#*=}"
       shift
       ;;
     --base)
@@ -157,6 +181,16 @@ done
 [ "$RUNS" -le 12 ] || die "--runs must be <= 12"
 [ "$CONCURRENCY" -ge 1 ] || die "--concurrency must be >= 1"
 [ -z "$MIN_SUCCESSFUL" ] || [ "$MIN_SUCCESSFUL" -ge 1 ] || die "--min-successful must be >= 1"
+# Codex silently ignores an unknown effort value instead of failing, so a typo
+# here would waste every reviewer run. Validate before spawning anything.
+case "$EFFORT" in
+  ""|minimal|low|medium|high|xhigh) ;;
+  *) die "--effort must be one of: minimal, low, medium, high, xhigh" ;;
+esac
+
+CODEX_FLAGS=()
+[ -z "$MODEL" ] || CODEX_FLAGS+=(-m "$MODEL")
+[ -z "$EFFORT" ] || CODEX_FLAGS+=(-c "model_reasoning_effort=$EFFORT")
 
 duration_to_seconds() {
   local value="$1"
@@ -188,13 +222,50 @@ C_RED=""
 C_DIM=""
 C_BOLD=""
 C_RESET=""
+UI_TTY=0
 if [ -t 1 ] && [ -n "${TERM:-}" ] && command -v tput >/dev/null 2>&1; then
+  UI_TTY=1
   C_GREEN="$(tput setaf 2 2>/dev/null || true)"
   C_RED="$(tput setaf 1 2>/dev/null || true)"
   C_DIM="$(tput dim 2>/dev/null || true)"
   C_BOLD="$(tput bold 2>/dev/null || true)"
   C_RESET="$(tput sgr0 2>/dev/null || true)"
 fi
+
+SPIN_FRAMES=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+SYM_OK="ok:"
+SYM_FAIL="FAIL:"
+HR_LINE="------------------------------------------------------------"
+if [ "$UI_TTY" -eq 1 ]; then
+  SYM_OK="✓"
+  SYM_FAIL="✗"
+  HR_LINE="────────────────────────────────────────────────────────────"
+fi
+
+hr() {
+  echo "${C_DIM}${HR_LINE}${C_RESET}"
+}
+
+row() {
+  printf '  %-10s %s\n' "$1" "$2"
+}
+
+# One transient status line at the bottom of the output, redrawn in place.
+# Only used on a TTY; everything permanent goes through plain echo.
+STATUS_SHOWN=0
+draw_status() {
+  if [ "$UI_TTY" -eq 1 ]; then
+    printf '\r\033[K%s' "${C_DIM}$1${C_RESET}"
+    STATUS_SHOWN=1
+  fi
+}
+
+clear_status() {
+  if [ "$STATUS_SHOWN" -eq 1 ]; then
+    printf '\r\033[K'
+    STATUS_SHOWN=0
+  fi
+}
 
 REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || die "run from inside the target git repository"
 CURRENT_REPO="$(gh repo view --json nameWithOwner -q .nameWithOwner)"
@@ -237,6 +308,7 @@ else
 fi
 OUT_DIR="$RUN_ROOT/output"
 WORKTREE="$RUN_ROOT/worktree"
+EVENTS_LOG="$OUT_DIR/events.log"
 mkdir -p "$OUT_DIR"
 
 GC_REMOVED=0
@@ -250,13 +322,27 @@ if [ "$GC_REMOVED" -gt 0 ]; then
   echo "${C_DIM}gc: removed $GC_REMOVED old run dir(s)${C_RESET}"
 fi
 
-echo "${C_BOLD}PR:       #$PR_NUMBER $PR_TITLE${C_RESET}"
-echo "Author:   @$AUTHOR_LOGIN"
-echo "Repo:     $CURRENT_REPO"
-echo "Base:     $BASE_REF (GitHub reported $INITIAL_BASE_SHA)"
-echo "Head:     $INITIAL_HEAD_SHA"
-echo "Draft:    $IS_DRAFT"
-echo "Run dir:  $RUN_ROOT"
+MODEL_DESC="codex default"
+if [ -n "$MODEL" ] && [ -n "$EFFORT" ]; then
+  MODEL_DESC="$MODEL (effort $EFFORT)"
+elif [ -n "$MODEL" ]; then
+  MODEL_DESC="$MODEL"
+elif [ -n "$EFFORT" ]; then
+  MODEL_DESC="codex default (effort $EFFORT)"
+fi
+
+echo "${C_BOLD}pr-codex-review v$VERSION${C_RESET}"
+hr
+row "PR" "${C_BOLD}#$PR_NUMBER $PR_TITLE${C_RESET}"
+row "Author" "@$AUTHOR_LOGIN"
+row "Repo" "$CURRENT_REPO"
+row "Base" "$BASE_REF (GitHub reported $INITIAL_BASE_SHA)"
+row "Head" "$INITIAL_HEAD_SHA"
+row "Draft" "$IS_DRAFT"
+row "Reviewers" "$RUNS (concurrency $CONCURRENCY, timeout $REVIEW_TIMEOUT)"
+row "Model" "$MODEL_DESC"
+row "Run dir" "$RUN_ROOT"
+hr
 
 cd "$REPO_ROOT"
 if [ -n "$RESUME_RUN" ]; then
@@ -315,8 +401,9 @@ run_reviewer() {
   local out="$OUT_DIR/reviewer-$idx.md"
   local log="$OUT_DIR/reviewer-$idx.log"
   local started elapsed rank
-  echo "${C_DIM}reviewer-$idx: start${C_RESET}"
   started="$(date +%s)"
+  # Reviewers run in the background, so they never write to the terminal
+  # directly; they append one event line and the main loop does the printing.
   if run_with_timeout "$REVIEW_TIMEOUT_SECONDS" "$REVIEW_TIMEOUT" run_codex_review "$out" >"$log" 2>&1; then
     elapsed="$(( $(date +%s) - started ))"
     # Claim the lowest free rank atomically; counting output files races
@@ -325,12 +412,12 @@ run_reviewer() {
     while ! mkdir "$OUT_DIR/.done-$rank" 2>/dev/null; do
       rank=$((rank + 1))
     done
-    echo "${C_GREEN}reviewer-$idx: done in $(format_duration "$elapsed") [$rank/$RUNS]${C_RESET}"
+    echo "ok $idx $elapsed $rank" >> "$EVENTS_LOG"
   else
     local rc=$?
     rm -f "$out"
     elapsed="$(( $(date +%s) - started ))"
-    echo "${C_RED}reviewer-$idx: failed with exit $rc after $(format_duration "$elapsed") -> $log${C_RESET}" >&2
+    echo "fail $idx $rc $elapsed" >> "$EVENTS_LOG"
     return "$rc"
   fi
 }
@@ -338,9 +425,9 @@ run_reviewer() {
 run_codex_review() {
   local out="$1"
   if [ "$USE_DIRENV" -eq 1 ]; then
-    (cd "$WORKTREE" && direnv exec "$WORKTREE" codex exec review --base "$BASE_REF" --ephemeral -o "$out")
+    (cd "$WORKTREE" && direnv exec "$WORKTREE" codex exec review ${CODEX_FLAGS[@]+"${CODEX_FLAGS[@]}"} --base "$BASE_REF" --ephemeral -o "$out")
   else
-    (cd "$WORKTREE" && codex exec review --base "$BASE_REF" --ephemeral -o "$out")
+    (cd "$WORKTREE" && codex exec review ${CODEX_FLAGS[@]+"${CODEX_FLAGS[@]}"} --base "$BASE_REF" --ephemeral -o "$out")
   fi
 }
 
@@ -405,25 +492,69 @@ reviewer_indices() {
 }
 
 if [ -z "$RESUME_RUN" ]; then
+  : > "$EVENTS_LOG"
   FAILED=0
-  batch=()
-  for idx in $(seq 1 "$RUNS"); do
-    run_reviewer "$idx" &
-    batch+=("$!")
-    if [ "${#batch[@]}" -ge "$CONCURRENCY" ]; then
-      for pid in "${batch[@]}"; do
-        wait "$pid" || FAILED=1
-      done
-      batch=()
-    fi
-  done
-  # Bash 3.2 aborts on "${batch[@]}" when the array is empty under set -u.
-  if [ "${#batch[@]}" -gt 0 ]; then
-    for pid in "${batch[@]}"; do
-      wait "$pid" || FAILED=1
-    done
-  fi
+  DONE_COUNT=0
+  FAIL_COUNT=0
+  EVENTS_SEEN=0
+  NEXT_IDX=1
+  TICK=0
+  REVIEW_STARTED="$(date +%s)"
+  PIDS=()
 
+  while :; do
+    # Reap finished reviewers. Bash 3.2 aborts on "${arr[@]}" when the array
+    # is empty under set -u, hence the ${arr[@]+...} expansions.
+    ALIVE=()
+    for pid in ${PIDS[@]+"${PIDS[@]}"}; do
+      if kill -0 "$pid" 2>/dev/null; then
+        ALIVE+=("$pid")
+      else
+        wait "$pid" 2>/dev/null || true
+      fi
+    done
+    PIDS=(${ALIVE[@]+"${ALIVE[@]}"})
+
+    # Fill free slots: at most CONCURRENCY reviewers run at any moment.
+    while [ "${#PIDS[@]}" -lt "$CONCURRENCY" ] && [ "$NEXT_IDX" -le "$RUNS" ]; do
+      if [ "$UI_TTY" -eq 0 ]; then
+        echo "reviewer-$NEXT_IDX: start"
+      fi
+      run_reviewer "$NEXT_IDX" &
+      PIDS+=("$!")
+      NEXT_IDX=$((NEXT_IDX + 1))
+    done
+
+    # Print a permanent line for every event that arrived since last poll.
+    NEW_EVENTS="$(tail -n +"$((EVENTS_SEEN + 1))" "$EVENTS_LOG" 2>/dev/null || true)"
+    if [ -n "$NEW_EVENTS" ]; then
+      while IFS=' ' read -r kind idx f1 f2; do
+        [ -n "$kind" ] || continue
+        EVENTS_SEEN=$((EVENTS_SEEN + 1))
+        clear_status
+        case "$kind" in
+          ok)
+            DONE_COUNT=$((DONE_COUNT + 1))
+            echo "${C_GREEN}${SYM_OK} reviewer-$idx done in $(format_duration "$f1")${C_RESET} ${C_DIM}[$f2/$RUNS]${C_RESET}"
+            ;;
+          fail)
+            FAIL_COUNT=$((FAIL_COUNT + 1))
+            FAILED=1
+            echo "${C_RED}${SYM_FAIL} reviewer-$idx failed with exit $f1 after $(format_duration "$f2") -> $OUT_DIR/reviewer-$idx.log${C_RESET}" >&2
+            ;;
+        esac
+      done <<<"$NEW_EVENTS"
+    fi
+
+    if [ "${#PIDS[@]}" -eq 0 ] && [ "$NEXT_IDX" -gt "$RUNS" ]; then
+      break
+    fi
+
+    draw_status "${SPIN_FRAMES[$((TICK % ${#SPIN_FRAMES[@]}))]} $DONE_COUNT done · $FAIL_COUNT failed · ${#PIDS[@]} running · $(format_duration "$(( $(date +%s) - REVIEW_STARTED ))")"
+    TICK=$((TICK + 1))
+    sleep 1
+  done
+  clear_status
 fi
 
 REVIEWER_INDICES=()
@@ -506,10 +637,24 @@ EOF
 
 run_aggregator() {
   if [ "$USE_DIRENV" -eq 1 ]; then
-    (cd "$WORKTREE" && direnv exec "$WORKTREE" codex exec --sandbox read-only --ephemeral -o "$FINAL_COMMENT" "$AGG_PROMPT" < "$ALL_REVIEWERS") >"$OUT_DIR/aggregator.log" 2>&1
+    (cd "$WORKTREE" && direnv exec "$WORKTREE" codex exec ${CODEX_FLAGS[@]+"${CODEX_FLAGS[@]}"} --sandbox read-only --ephemeral -o "$FINAL_COMMENT" "$AGG_PROMPT" < "$ALL_REVIEWERS") >"$OUT_DIR/aggregator.log" 2>&1
   else
-    (cd "$WORKTREE" && codex exec --sandbox read-only --ephemeral -o "$FINAL_COMMENT" "$AGG_PROMPT" < "$ALL_REVIEWERS") >"$OUT_DIR/aggregator.log" 2>&1
+    (cd "$WORKTREE" && codex exec ${CODEX_FLAGS[@]+"${CODEX_FLAGS[@]}"} --sandbox read-only --ephemeral -o "$FINAL_COMMENT" "$AGG_PROMPT" < "$ALL_REVIEWERS") >"$OUT_DIR/aggregator.log" 2>&1
   fi
+}
+
+# Wait for a background pid while ticking the transient status line.
+spin_wait() {
+  local pid="$1" label="$2"
+  local started tick=0
+  started="$(date +%s)"
+  while kill -0 "$pid" 2>/dev/null; do
+    draw_status "${SPIN_FRAMES[$((tick % ${#SPIN_FRAMES[@]}))]} $label · $(format_duration "$(( $(date +%s) - started ))")"
+    tick=$((tick + 1))
+    sleep 1
+  done
+  clear_status
+  wait "$pid"
 }
 
 aggregator_output_valid() {
@@ -523,11 +668,15 @@ aggregator_output_valid() {
   fi
 }
 
-echo "${C_DIM}aggregator: combining $SUCCESSFUL_REVIEWS reviewer output(s)...${C_RESET}"
+if [ "$UI_TTY" -eq 0 ]; then
+  echo "aggregator: combining $SUCCESSFUL_REVIEWS reviewer output(s)..."
+fi
 AGG_OK=0
 for attempt in 1 2; do
-  run_aggregator
-  if aggregator_output_valid; then
+  run_aggregator &
+  if ! spin_wait "$!" "aggregating $SUCCESSFUL_REVIEWS reviewer output(s)"; then
+    echo "aggregator: codex exited nonzero, see $OUT_DIR/aggregator.log" >&2
+  elif aggregator_output_valid; then
     AGG_OK=1
     break
   fi
@@ -548,16 +697,18 @@ else
   echo
 fi
 
-echo "${C_DIM}----------------------------------------${C_RESET}"
+hr
 if [ "$SUCCESSFUL_REVIEWS" -eq "$RUNS" ]; then
-  echo "Reviewers: $SUCCESSFUL_REVIEWS/$RUNS succeeded"
+  row "Reviewers" "${C_GREEN}$SUCCESSFUL_REVIEWS/$RUNS succeeded${C_RESET}"
 else
-  echo "Reviewers: $SUCCESSFUL_REVIEWS/$RUNS succeeded ${C_RED}($((RUNS - SUCCESSFUL_REVIEWS)) failed)${C_RESET}"
+  row "Reviewers" "$SUCCESSFUL_REVIEWS/$RUNS succeeded ${C_RED}($((RUNS - SUCCESSFUL_REVIEWS)) failed)${C_RESET}"
 fi
-echo "Comment:   $FINAL_COMMENT"
+row "Duration" "$(format_duration "$(( $(date +%s) - SCRIPT_STARTED ))")"
+row "Comment" "$FINAL_COMMENT"
 if [ "$POST" -eq 1 ]; then
   COMMENT_URL="$(gh pr comment "$URL_PR_NUMBER" --body-file "$FINAL_COMMENT")"
-  echo "Posted:    ${C_GREEN}yes${C_RESET} -> ${COMMENT_URL:-PR #$PR_NUMBER}"
+  row "Posted" "${C_GREEN}yes${C_RESET} -> ${COMMENT_URL:-PR #$PR_NUMBER}"
 else
-  echo "Posted:    no (dry run; post with: gh pr comment $URL_PR_NUMBER --body-file $FINAL_COMMENT)"
+  row "Posted" "no (dry run; post with: gh pr comment $URL_PR_NUMBER --body-file $FINAL_COMMENT)"
 fi
+hr

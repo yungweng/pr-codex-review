@@ -58,6 +58,12 @@ Use `--dry-run` to inspect the comment before anything touches GitHub:
 pr-codex-review 123 --dry-run
 ```
 
+Pick the reviewer count, model, and reasoning effort per run:
+
+```bash
+pr-codex-review 123 -n 8 --model gpt-5.5 --effort high
+```
+
 ## What It Does
 
 1. Reads PR metadata with `gh`.
@@ -73,11 +79,18 @@ pr-codex-review 123 --dry-run
 ## Options
 
 ```text
---runs N
+-n, --runs N
 Number of Codex reviewer passes. Default: 6.
 
 --concurrency N
-Number of reviewer passes to run at the same time. Default: same as --runs.
+Maximum number of reviewer passes running at the same time. Default: same as --runs.
+
+--model MODEL
+Model for the Codex reviewers and the aggregator. Default: your codex default.
+
+--effort LEVEL
+Reasoning effort for the Codex reviewers and the aggregator.
+One of: minimal, low, medium, high, xhigh. Default: your codex default.
 
 --base BRANCH
 Base branch to review against. Default: the PR base branch.
