@@ -4,27 +4,29 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 Usage:
-  pr-codex-review <github-pr-url> [options]
+  pr-codex-review <pr-number|github-pr-url> [options]
 
 Options:
   --runs N                 Number of Codex reviewer passes. Default: 6
-  --concurrency N          Reviewer passes to run at once. Default: 2
+  --concurrency N          Reviewer passes to run at once. Default: same as --runs
   --base BRANCH            Base branch to review against. Default: PR base branch
-  --post                   Post the aggregated comment to the PR
-  --cleanup                Remove the temporary git worktree after the run
+  --dry-run                Write the aggregated comment to disk without posting it
+  --keep-worktree          Keep the temporary git worktree after a successful run
   --resume-run DIR         Reuse an existing run directory and only aggregate/post
-  --allow-base-drift       Aggregate/post even if the base branch moved during review
   --review-timeout DURATION
                            Kill a reviewer that runs too long. Default: 45m
   --min-successful N       Minimum reviewer outputs required to aggregate/post.
-                           Default: all requested runs
+                           Default: majority of the requested runs
   --no-direnv              Skip direnv allow/exec
   --allow-envrc-change     Allow automatic direnv allow even when .envrc changed
   -h, --help               Show this help
 
+Deprecated no-ops (now the default behavior):
+  --post, --cleanup, --allow-base-drift
+
 Examples:
-  pr-codex-review https://github.com/owner/repo/pull/123
-  pr-codex-review https://github.com/owner/repo/pull/123 --runs 8 --post
+  pr-codex-review 123
+  pr-codex-review https://github.com/owner/repo/pull/123 --runs 8 --dry-run
 EOF
 }
 
@@ -40,12 +42,11 @@ need() {
 PR_URL=""
 RUNS=6
 RUNS_SET=0
-CONCURRENCY=2
+CONCURRENCY=""
 BASE_BRANCH=""
-POST=0
-CLEANUP=0
+POST=1
+CLEANUP=1
 RESUME_RUN=""
-ALLOW_BASE_DRIFT=0
 USE_DIRENV=1
 ALLOW_ENVRC_CHANGE=0
 REVIEW_TIMEOUT="45m"
@@ -79,12 +80,16 @@ while [ "$#" -gt 0 ]; do
       BASE_BRANCH="${1#*=}"
       shift
       ;;
-    --post)
-      POST=1
+    --dry-run)
+      POST=0
       shift
       ;;
-    --cleanup)
-      CLEANUP=1
+    --keep-worktree)
+      CLEANUP=0
+      shift
+      ;;
+    --post|--cleanup|--allow-base-drift)
+      # Deprecated no-ops: this is the default behavior now.
       shift
       ;;
     --resume-run)
@@ -93,10 +98,6 @@ while [ "$#" -gt 0 ]; do
       ;;
     --resume-run=*)
       RESUME_RUN="${1#*=}"
-      shift
-      ;;
-    --allow-base-drift)
-      ALLOW_BASE_DRIFT=1
       shift
       ;;
     --review-timeout)
@@ -142,6 +143,7 @@ done
 
 [ -n "$PR_URL" ] || { usage; exit 1; }
 [[ "$RUNS" =~ ^[0-9]+$ ]] || die "--runs must be a number"
+[ -n "$CONCURRENCY" ] || CONCURRENCY="$RUNS"
 [[ "$CONCURRENCY" =~ ^[0-9]+$ ]] || die "--concurrency must be a number"
 [ -z "$MIN_SUCCESSFUL" ] || [[ "$MIN_SUCCESSFUL" =~ ^[0-9]+$ ]] || die "--min-successful must be a number"
 [ "$RUNS" -ge 1 ] || die "--runs must be >= 1"
@@ -174,14 +176,30 @@ if [ "$USE_DIRENV" -eq 1 ]; then
   need direnv
 fi
 
+C_GREEN=""
+C_RED=""
+C_DIM=""
+C_BOLD=""
+C_RESET=""
+if [ -t 1 ] && [ -n "${TERM:-}" ] && command -v tput >/dev/null 2>&1; then
+  C_GREEN="$(tput setaf 2 2>/dev/null || true)"
+  C_RED="$(tput setaf 1 2>/dev/null || true)"
+  C_DIM="$(tput dim 2>/dev/null || true)"
+  C_BOLD="$(tput bold 2>/dev/null || true)"
+  C_RESET="$(tput sgr0 2>/dev/null || true)"
+fi
+
 REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || die "run from inside the target git repository"
 CURRENT_REPO="$(gh repo view --json nameWithOwner -q .nameWithOwner)"
 
-if [[ "$PR_URL" =~ ^https://github.com/([^/]+/[^/]+)/pull/([0-9]+) ]]; then
+if [[ "$PR_URL" =~ ^[0-9]+$ ]]; then
+  URL_REPO="$CURRENT_REPO"
+  URL_PR_NUMBER="$PR_URL"
+elif [[ "$PR_URL" =~ ^https://github.com/([^/]+/[^/]+)/pull/([0-9]+) ]]; then
   URL_REPO="${BASH_REMATCH[1]}"
   URL_PR_NUMBER="${BASH_REMATCH[2]}"
 else
-  die "expected a GitHub PR URL like https://github.com/owner/repo/pull/123"
+  die "expected a PR number or a GitHub PR URL like https://github.com/owner/repo/pull/123"
 fi
 
 [ "$URL_REPO" = "$CURRENT_REPO" ] || die "PR URL is for $URL_REPO, but current checkout is $CURRENT_REPO"
@@ -194,6 +212,7 @@ PR_BASE_BRANCH="$(jq -r '.baseRefName' <<<"$META")"
 INITIAL_BASE_SHA="$(jq -r '.baseRefOid' <<<"$META")"
 INITIAL_HEAD_SHA="$(jq -r '.headRefOid' <<<"$META")"
 IS_DRAFT="$(jq -r '.isDraft' <<<"$META")"
+PR_URL="$(jq -r '.url' <<<"$META")"
 
 if [ -z "$BASE_BRANCH" ]; then
   BASE_BRANCH="$PR_BASE_BRANCH"
@@ -213,7 +232,7 @@ OUT_DIR="$RUN_ROOT/output"
 WORKTREE="$RUN_ROOT/worktree"
 mkdir -p "$OUT_DIR"
 
-echo "PR:       #$PR_NUMBER $PR_TITLE"
+echo "${C_BOLD}PR:       #$PR_NUMBER $PR_TITLE${C_RESET}"
 echo "Author:   @$AUTHOR_LOGIN"
 echo "Repo:     $CURRENT_REPO"
 echo "Base:     $BASE_REF (GitHub reported $INITIAL_BASE_SHA)"
@@ -236,19 +255,21 @@ if [ -n "$RESUME_RUN" ]; then
   echo "Base reviewed: $REVIEW_BASE_SHA"
   echo "Head reviewed: $INITIAL_HEAD_SHA"
 else
-  git fetch origin "+refs/heads/$BASE_BRANCH:refs/remotes/origin/$BASE_BRANCH"
+  git fetch -q origin "+refs/heads/$BASE_BRANCH:refs/remotes/origin/$BASE_BRANCH"
   REVIEW_BASE_SHA="$(git rev-parse "$BASE_REF")"
   echo "Fetched base: $REVIEW_BASE_SHA"
-  git fetch origin "+pull/$PR_NUMBER/head:refs/pr-codex-review/$PR_NUMBER"
+  git fetch -q origin "+pull/$PR_NUMBER/head:refs/pr-codex-review/$PR_NUMBER"
   FETCHED_HEAD_SHA="$(git rev-parse "refs/pr-codex-review/$PR_NUMBER")"
   [ "$FETCHED_HEAD_SHA" = "$INITIAL_HEAD_SHA" ] || die "fetched PR head $FETCHED_HEAD_SHA differs from GitHub metadata $INITIAL_HEAD_SHA"
 
-  git worktree add --detach "$WORKTREE" "$FETCHED_HEAD_SHA" >/dev/null
+  git worktree add --quiet --detach "$WORKTREE" "$FETCHED_HEAD_SHA"
   echo "Worktree: $WORKTREE"
 fi
 
 cleanup() {
-  if [ "$CLEANUP" -eq 1 ] && [ -d "$WORKTREE" ]; then
+  local rc=$?
+  # Keep the worktree on failure so --resume-run can pick the run back up.
+  if [ "$rc" -eq 0 ] && [ "$CLEANUP" -eq 1 ] && [ -d "$WORKTREE" ]; then
     git -C "$REPO_ROOT" worktree remove "$WORKTREE" --force >/dev/null 2>&1 || true
   fi
 }
@@ -279,21 +300,30 @@ review_prompt() {
   esac
 }
 
+format_duration() {
+  local total="$1"
+  printf '%dm%02ds' "$((total / 60))" "$((total % 60))"
+}
+
 run_reviewer() {
   local idx="$1"
   local out="$OUT_DIR/reviewer-$idx.md"
   local log="$OUT_DIR/reviewer-$idx.log"
   local focus="$OUT_DIR/reviewer-$idx.focus.md"
-  local prompt
+  local prompt started elapsed done_count
   prompt="$(review_prompt "$idx")"
   printf '%s\n' "$prompt" > "$focus"
-  echo "reviewer-$idx: start"
+  echo "${C_DIM}reviewer-$idx: start${C_RESET}"
+  started="$(date +%s)"
   if run_with_timeout "$REVIEW_TIMEOUT_SECONDS" "$REVIEW_TIMEOUT" run_codex_review "$out" >"$log" 2>&1; then
-    echo "reviewer-$idx: done -> $out"
+    elapsed="$(( $(date +%s) - started ))"
+    done_count="$(reviewer_indices | wc -l | tr -d ' ')"
+    echo "${C_GREEN}reviewer-$idx: done in $(format_duration "$elapsed") [$done_count/$RUNS]${C_RESET}"
   else
     local rc=$?
     rm -f "$out"
-    echo "reviewer-$idx: failed with exit $rc -> $log" >&2
+    elapsed="$(( $(date +%s) - started ))"
+    echo "${C_RED}reviewer-$idx: failed with exit $rc after $(format_duration "$elapsed") -> $log${C_RESET}" >&2
     return "$rc"
   fi
 }
@@ -380,9 +410,12 @@ if [ -z "$RESUME_RUN" ]; then
       batch=()
     fi
   done
-  for pid in "${batch[@]}"; do
-    wait "$pid" || FAILED=1
-  done
+  # Bash 3.2 aborts on "${batch[@]}" when the array is empty under set -u.
+  if [ "${#batch[@]}" -gt 0 ]; then
+    for pid in "${batch[@]}"; do
+      wait "$pid" || FAILED=1
+    done
+  fi
 
 fi
 
@@ -392,11 +425,7 @@ while IFS= read -r idx; do
 done < <(reviewer_indices)
 SUCCESSFUL_REVIEWS="${#REVIEWER_INDICES[@]}"
 if [ -z "$MIN_SUCCESSFUL" ]; then
-  if [ -n "$RESUME_RUN" ]; then
-    MIN_SUCCESSFUL="$SUCCESSFUL_REVIEWS"
-  else
-    MIN_SUCCESSFUL="$RUNS"
-  fi
+  MIN_SUCCESSFUL="$(( (RUNS + 1) / 2 ))"
 fi
 if [ "$SUCCESSFUL_REVIEWS" -lt "$MIN_SUCCESSFUL" ]; then
   echo "Only $SUCCESSFUL_REVIEWS reviewer output(s) available; need $MIN_SUCCESSFUL." >&2
@@ -419,13 +448,6 @@ if [ "$LATEST_HEAD_SHA" != "$INITIAL_HEAD_SHA" ]; then
   exit 3
 fi
 if [ "$LATEST_BASE_SHA" != "$REVIEW_BASE_SHA" ]; then
-  if [ "$ALLOW_BASE_DRIFT" -ne 1 ]; then
-    echo "Base branch changed during review; refusing to aggregate/post stale findings." >&2
-    echo "Reviewed base/head: $REVIEW_BASE_SHA / $INITIAL_HEAD_SHA" >&2
-    echo "Latest  base/head: $LATEST_BASE_SHA / $LATEST_HEAD_SHA" >&2
-    echo "Re-run, or use --resume-run with --allow-base-drift if the base movement is safe to ignore." >&2
-    exit 3
-  fi
   BASE_DRIFT_NOTE="Base branch moved after review: reviewed $REVIEW_BASE_SHA, latest $LATEST_BASE_SHA. The PR head stayed the same."
   echo "warning: $BASE_DRIFT_NOTE" >&2
 fi
@@ -485,6 +507,7 @@ Rules:
 EOF
 )"
 
+echo "${C_DIM}aggregator: combining $SUCCESSFUL_REVIEWS reviewer output(s)...${C_RESET}"
 if [ "$USE_DIRENV" -eq 1 ]; then
   (cd "$WORKTREE" && direnv exec "$WORKTREE" codex exec --sandbox read-only --ephemeral -o "$FINAL_COMMENT" "$AGG_PROMPT" < "$ALL_REVIEWERS") >"$OUT_DIR/aggregator.log" 2>&1
 else
@@ -500,11 +523,24 @@ if grep -Eiq 'I tried to post|gh pr comment|api\.github\.com|exact comment I pre
   exit 4
 fi
 
-echo "Final comment: $FINAL_COMMENT"
-
-if [ "$POST" -eq 1 ]; then
-  gh pr comment "$URL_PR_NUMBER" --body-file "$FINAL_COMMENT"
-  echo "Posted comment to PR #$PR_NUMBER."
+echo
+if [ -t 1 ] && command -v glow >/dev/null 2>&1; then
+  glow "$FINAL_COMMENT" || cat "$FINAL_COMMENT"
 else
-  echo "Dry run complete. Re-run with --post to comment on the PR."
+  cat "$FINAL_COMMENT"
+  echo
+fi
+
+echo "${C_DIM}----------------------------------------${C_RESET}"
+if [ "$SUCCESSFUL_REVIEWS" -eq "$RUNS" ]; then
+  echo "Reviewers: $SUCCESSFUL_REVIEWS/$RUNS succeeded"
+else
+  echo "Reviewers: $SUCCESSFUL_REVIEWS/$RUNS succeeded ${C_RED}($((RUNS - SUCCESSFUL_REVIEWS)) failed)${C_RESET}"
+fi
+echo "Comment:   $FINAL_COMMENT"
+if [ "$POST" -eq 1 ]; then
+  COMMENT_URL="$(gh pr comment "$URL_PR_NUMBER" --body-file "$FINAL_COMMENT")"
+  echo "Posted:    ${C_GREEN}yes${C_RESET} -> ${COMMENT_URL:-PR #$PR_NUMBER}"
+else
+  echo "Posted:    no (dry run; post with: gh pr comment $URL_PR_NUMBER --body-file $FINAL_COMMENT)"
 fi

@@ -1,6 +1,6 @@
 # pr-codex-review
 
-Local helper for running several Codex PR reviews, aggregating the results, and optionally posting one friendly GitHub PR comment.
+Local helper for running several Codex PR reviews, aggregating the results, and posting one friendly GitHub PR comment.
 
 This is a local wrapper around `gh`, `git worktree`, `direnv`, and `codex exec review`. It uses your local GitHub and Codex authentication. It does not ship credentials.
 
@@ -36,20 +36,27 @@ codex
 direnv
 ```
 
+If `glow` is installed, the final comment is rendered in the terminal with it; otherwise it is printed as plain text.
+
 ## Normal Run
 
-Use this when you want 6 reviewers in parallel and want the final comment posted automatically:
+From inside the repo checkout, the PR number is enough:
 
 ```bash
-pr-codex-review https://github.com/owner/repo/pull/123 \
-  --runs 6 \
-  --concurrency 6 \
-  --min-successful 5 \
-  --allow-base-drift \
-  --post
+pr-codex-review 123
 ```
 
-Without `--post`, the command is a dry run. It writes the final Markdown comment to disk but does not touch GitHub.
+This runs 6 reviewers in parallel, aggregates their findings, posts the comment to the PR, and removes the temporary worktree. A full PR URL still works:
+
+```bash
+pr-codex-review https://github.com/owner/repo/pull/123
+```
+
+Use `--dry-run` to inspect the comment before anything touches GitHub:
+
+```bash
+pr-codex-review 123 --dry-run
+```
 
 ## What It Does
 
@@ -60,8 +67,8 @@ Without `--post`, the command is a dry run. It writes the final Markdown comment
 5. Runs `direnv allow`.
 6. Runs `codex exec review --base origin/<base-branch>` several times.
 7. Stores each reviewer output.
-8. Aggregates the outputs into one PR comment.
-9. Posts the comment only when `--post` is set.
+8. Aggregates the outputs into one PR comment and prints a preview.
+9. Posts the comment (unless `--dry-run` is set) and cleans up the worktree.
 
 ## Options
 
@@ -70,17 +77,13 @@ Without `--post`, the command is a dry run. It writes the final Markdown comment
 Number of Codex reviewer passes. Default: 6.
 
 --concurrency N
-Number of reviewer passes to run at the same time. Default: 2.
+Number of reviewer passes to run at the same time. Default: same as --runs.
 
 --base BRANCH
 Base branch to review against. Default: the PR base branch.
 
---post
-Post the aggregated comment to the PR. Without this, it only writes files.
-
---allow-base-drift
-Allow aggregation/posting if only the base branch moved during review.
-The PR head must still match the reviewed commit.
+--dry-run
+Write the aggregated comment to disk without posting it to the PR.
 
 --review-timeout DURATION
 Kill a reviewer that runs too long. Default: 45m.
@@ -88,15 +91,16 @@ Use `0` to disable. Supports values like `30m`, `45m`, `1h`, or raw seconds.
 
 --min-successful N
 Minimum reviewer outputs required to aggregate/post.
-Default: all requested runs.
-Use `--runs 6 --min-successful 5` to tolerate one failed or timed-out reviewer.
+Default: majority of the requested runs (4 of 6, 4 of 7, ...).
+Use `--min-successful 6` with `--runs 6` to require every reviewer.
 
 --resume-run DIR
 Reuse an existing run directory and only aggregate/post.
 Use this when reviewer runs finished but aggregation or posting stopped.
 
---cleanup
-Remove the temporary worktree after the run.
+--keep-worktree
+Keep the temporary worktree after a successful run.
+Failed runs always keep the worktree so --resume-run can reuse it.
 
 --no-direnv
 Skip direnv.
@@ -109,36 +113,31 @@ Use this only after manually checking the `.envrc` diff.
 Show command help.
 ```
 
+Deprecated no-ops, kept so old invocations do not break (they describe the default behavior now):
+
+```text
+--post
+--cleanup
+--allow-base-drift
+```
+
 ## Resume After A Stop
 
 If the runner prints a `Run dir:` and stops after the reviewers finished, reuse that directory:
 
 ```bash
-pr-codex-review https://github.com/owner/repo/pull/123 \
-  --resume-run ~/.cache/pr-codex-review/owner-repo-pr-123-YYYYMMDD-HHMMSS \
-  --allow-base-drift \
-  --post
+pr-codex-review 123 --resume-run ~/.cache/pr-codex-review/owner-repo-pr-123-YYYYMMDD-HHMMSS
 ```
 
-This does not rerun the expensive reviewer passes.
-
-If one reviewer failed or timed out but enough reviewer outputs exist:
-
-```bash
-pr-codex-review https://github.com/owner/repo/pull/123 \
-  --resume-run ~/.cache/pr-codex-review/owner-repo-pr-123-YYYYMMDD-HHMMSS \
-  --min-successful 5 \
-  --allow-base-drift \
-  --post
-```
+This does not rerun the expensive reviewer passes. Failed runs keep their worktree, so resuming always works until the run completes successfully.
 
 ## Safety Stops
 
 The runner refuses to post if the PR head changed during review. That means the PR received a new commit, so old review results may no longer match the diff.
 
-The runner also refuses automatic `direnv allow` if the PR changed `.envrc`, unless you pass `--allow-envrc-change`.
+If only the base branch moved during review, the runner continues and the final comment includes a note with the reviewed base SHA and the latest base SHA.
 
-If only the base branch moved during review, pass `--allow-base-drift` to continue. The final comment includes a note with the reviewed base SHA and latest base SHA.
+The runner also refuses automatic `direnv allow` if the PR changed `.envrc`, unless you pass `--allow-envrc-change`.
 
 ## Output Files
 
@@ -147,6 +146,8 @@ Each run writes files under:
 ```text
 ~/.cache/pr-codex-review/<repo>-pr-<number>-<timestamp>/output/
 ```
+
+The `output/` directory always survives; only the `worktree/` directory is removed after a successful run (keep it with `--keep-worktree`).
 
 Useful files:
 
@@ -159,7 +160,7 @@ final-pr-comment.md
 aggregator.log
 ```
 
-View the final comment:
+View the final comment again later:
 
 ```bash
 RUN=$(ls -td ~/.cache/pr-codex-review/owner-repo-pr-123-* | head -1)
@@ -168,20 +169,20 @@ glow "$RUN/output/final-pr-comment.md"
 
 ## Quick Commands
 
+Post (default):
+
+```bash
+pr-codex-review 123
+```
+
 Dry run:
 
 ```bash
-pr-codex-review <PR_URL> --runs 6 --concurrency 6 --min-successful 5 --allow-base-drift
-```
-
-Post:
-
-```bash
-pr-codex-review <PR_URL> --runs 6 --concurrency 6 --min-successful 5 --allow-base-drift --post
+pr-codex-review 123 --dry-run
 ```
 
 Resume and post:
 
 ```bash
-pr-codex-review <PR_URL> --resume-run <RUN_DIR> --min-successful 5 --allow-base-drift --post
+pr-codex-review 123 --resume-run <RUN_DIR>
 ```
