@@ -74,7 +74,7 @@ pr-codex-review 123 -n 8 --model gpt-5.5 --effort high
 6. Runs `codex exec review --base origin/<base-branch>` several times.
 7. Stores each reviewer output.
 8. Aggregates the outputs into one PR comment and prints a preview.
-9. Posts the comment (unless `--dry-run` is set) and cleans up the worktree.
+9. Posts the comment (unless `--dry-run` is set), writes a machine-readable `findings.json`, and cleans up the worktree.
 
 ## Options
 
@@ -173,8 +173,35 @@ reviewer-2.md
 ...
 all-reviewers.md
 final-pr-comment.md
+findings.json
 aggregator.log
 ```
+
+## Machine-Readable Findings
+
+The aggregated comment always uses exactly five sections (`## Summary`, `## Blockers`, `## Critical`, `## Suggestions`, `## Questions`) with one top-level bullet per finding. The runner validates this structure and retries the aggregation once if it is violated; a run that still cannot produce it fails instead of posting.
+
+Next to the comment, each successful run writes `findings.json` with per-section counts, so scripts (for example an automated fix loop) can branch on the result without parsing Markdown:
+
+```json
+{
+  "schema": 1,
+  "pr": 123,
+  "head_sha": "…",
+  "base_sha": "…",
+  "reviewers_succeeded": 6,
+  "reviewers_requested": 6,
+  "blockers": 0,
+  "critical": 2,
+  "suggestions": 3,
+  "questions": 1,
+  "comment_file": "…/output/final-pr-comment.md",
+  "posted": true,
+  "comment_url": "https://github.com/owner/repo/pull/123#issuecomment-…"
+}
+```
+
+`comment_url` is `null` on `--dry-run` runs.
 
 View the final comment again later:
 

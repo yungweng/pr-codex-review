@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 SCRIPT_STARTED="$(date +%s)"
 
 usage() {
@@ -628,8 +628,9 @@ Rules:
 - Deduplicate overlapping findings.
 - Do not invent findings that are not present in the reviewer outputs.
 - Keep only findings grounded in reviewer evidence.
-- Prefer this structure: Summary, Blockers, Critical, Suggestions, Questions.
-- If there are no blockers or critical issues, say that clearly.
+- Use exactly these five sections, in this order, as level-2 headings: ## Summary, ## Blockers, ## Critical, ## Suggestions, ## Questions.
+- List every finding in Blockers, Critical, Suggestions, and Questions as a top-level bullet line starting with "- ".
+- If a section has no items, write "None." as its only content.
 - Do not mention internal reviewer count, Codex sessions, or automation details.
 - Keep the comment concise enough for a GitHub PR discussion.
 EOF
@@ -658,6 +659,7 @@ spin_wait() {
 }
 
 aggregator_output_valid() {
+  local heading
   if head -n 1 "$FINAL_COMMENT" | grep -Eq '^```'; then
     echo "Aggregator wrapped the comment in a code fence." >&2
     return 1
@@ -666,6 +668,56 @@ aggregator_output_valid() {
     echo "Aggregator produced meta-output instead of a PR comment." >&2
     return 1
   fi
+  # findings.json is only trustworthy when every section heading is present;
+  # a renamed heading must fail loudly instead of silently counting as zero.
+  for heading in Summary Blockers Critical Suggestions Questions; do
+    if ! grep -Eiq "^##[[:space:]]+${heading}[[:space:]]*\$" "$FINAL_COMMENT"; then
+      echo "Aggregator output is missing the '## $heading' section." >&2
+      return 1
+    fi
+  done
+  # A finding written as prose instead of a bullet would count as zero, so a
+  # findings section must contain either bullets or a plain "None." statement.
+  for heading in Blockers Critical Suggestions Questions; do
+    if ! section_content_ok "$heading"; then
+      echo "Aggregator section '## $heading' has neither bullet findings nor 'None.'" >&2
+      return 1
+    fi
+  done
+}
+
+section_content_ok() {
+  local heading="$1"
+  awk -v h="$heading" '
+    /^##[ \t]/ {
+      section = tolower($0)
+      sub(/^##[ \t]+/, "", section)
+      sub(/[ \t]*$/, "", section)
+      inside = (section == tolower(h))
+      next
+    }
+    inside && /^[-*][ \t]/ { bullets++ }
+    inside && /[^ \t]/ && !/^[-*][ \t]/ {
+      text++
+      if (tolower($0) !~ /^none[.!]?([ \t]|$)/) other++
+    }
+    END { exit !(bullets > 0 || (text > 0 && other == 0)) }
+  ' "$FINAL_COMMENT"
+}
+
+count_findings() {
+  local heading="$1"
+  awk -v h="$heading" '
+    /^##[ \t]/ {
+      section = tolower($0)
+      sub(/^##[ \t]+/, "", section)
+      sub(/[ \t]*$/, "", section)
+      inside = (section == tolower(h))
+      next
+    }
+    inside && /^[-*][ \t]/ { n++ }
+    END { print n + 0 }
+  ' "$FINAL_COMMENT"
 }
 
 if [ "$UI_TTY" -eq 0 ]; then
@@ -697,16 +749,64 @@ else
   echo
 fi
 
+BLOCKERS_COUNT="$(count_findings Blockers)"
+CRITICAL_COUNT="$(count_findings Critical)"
+SUGGESTIONS_COUNT="$(count_findings Suggestions)"
+QUESTIONS_COUNT="$(count_findings Questions)"
+
+COMMENT_URL=""
+if [ "$POST" -eq 1 ]; then
+  COMMENT_URL="$(gh pr comment "$URL_PR_NUMBER" --body-file "$FINAL_COMMENT")"
+fi
+
+FINDINGS_JSON="$OUT_DIR/findings.json"
+jq -n \
+  --argjson pr "$PR_NUMBER" \
+  --arg head_sha "$INITIAL_HEAD_SHA" \
+  --arg base_sha "$REVIEW_BASE_SHA" \
+  --argjson reviewers_succeeded "$SUCCESSFUL_REVIEWS" \
+  --argjson reviewers_requested "$RUNS" \
+  --argjson blockers "$BLOCKERS_COUNT" \
+  --argjson critical "$CRITICAL_COUNT" \
+  --argjson suggestions "$SUGGESTIONS_COUNT" \
+  --argjson questions "$QUESTIONS_COUNT" \
+  --arg comment_file "$FINAL_COMMENT" \
+  --argjson posted "$([ "$POST" -eq 1 ] && echo true || echo false)" \
+  --arg comment_url "$COMMENT_URL" \
+  '{
+    schema: 1,
+    pr: $pr,
+    head_sha: $head_sha,
+    base_sha: $base_sha,
+    reviewers_succeeded: $reviewers_succeeded,
+    reviewers_requested: $reviewers_requested,
+    blockers: $blockers,
+    critical: $critical,
+    suggestions: $suggestions,
+    questions: $questions,
+    comment_file: $comment_file,
+    posted: $posted,
+    comment_url: (if $comment_url == "" then null else $comment_url end)
+  }' > "$FINDINGS_JSON"
+
+FINDINGS_SUMMARY="$BLOCKERS_COUNT blockers, $CRITICAL_COUNT critical, $SUGGESTIONS_COUNT suggestions, $QUESTIONS_COUNT questions"
+if [ $((BLOCKERS_COUNT + CRITICAL_COUNT)) -gt 0 ]; then
+  FINDINGS_SUMMARY="${C_RED}$FINDINGS_SUMMARY${C_RESET}"
+else
+  FINDINGS_SUMMARY="${C_GREEN}$FINDINGS_SUMMARY${C_RESET}"
+fi
+
 hr
 if [ "$SUCCESSFUL_REVIEWS" -eq "$RUNS" ]; then
   row "Reviewers" "${C_GREEN}$SUCCESSFUL_REVIEWS/$RUNS succeeded${C_RESET}"
 else
   row "Reviewers" "$SUCCESSFUL_REVIEWS/$RUNS succeeded ${C_RED}($((RUNS - SUCCESSFUL_REVIEWS)) failed)${C_RESET}"
 fi
+row "Findings" "$FINDINGS_SUMMARY"
 row "Duration" "$(format_duration "$(( $(date +%s) - SCRIPT_STARTED ))")"
 row "Comment" "$FINAL_COMMENT"
+row "JSON" "$FINDINGS_JSON"
 if [ "$POST" -eq 1 ]; then
-  COMMENT_URL="$(gh pr comment "$URL_PR_NUMBER" --body-file "$FINAL_COMMENT")"
   row "Posted" "${C_GREEN}yes${C_RESET} -> ${COMMENT_URL:-PR #$PR_NUMBER}"
 else
   row "Posted" "no (dry run; post with: gh pr comment $URL_PR_NUMBER --body-file $FINAL_COMMENT)"
