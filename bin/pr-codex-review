@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="1.2.0"
+VERSION="1.2.1"
 SCRIPT_STARTED="$(date +%s)"
 
 usage() {
@@ -191,6 +191,9 @@ esac
 CODEX_FLAGS=()
 [ -z "$MODEL" ] || CODEX_FLAGS+=(-m "$MODEL")
 [ -z "$EFFORT" ] || CODEX_FLAGS+=(-c "model_reasoning_effort=$EFFORT")
+# Serena brings no value for diff reviews and its per-reviewer server spawns
+# have deadlocked runs before (hung write_memory, duplicate instances).
+CODEX_FLAGS+=(-c "mcp_servers.serena.enabled=false")
 
 duration_to_seconds() {
   local value="$1"
