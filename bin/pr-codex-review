@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="1.2.1"
+VERSION="1.3.0"
 SCRIPT_STARTED="$(date +%s)"
 
 usage() {
@@ -13,9 +13,9 @@ Options:
   -n, --runs N             Number of Codex reviewer passes. Default: 6
   --concurrency N          Max reviewer passes running at once. Default: same as --runs
   --model MODEL            Model for the Codex reviewers and aggregator.
-                           Default: your codex default
+                           Default: gpt-5.5
   --effort LEVEL           Reasoning effort: minimal, low, medium, high, xhigh.
-                           Default: your codex default
+                           Default: medium
   --base BRANCH            Base branch to review against. Default: PR base branch
   --dry-run                Write the aggregated comment to disk without posting it
   --keep-worktree          Keep the temporary git worktree after a successful run
@@ -34,7 +34,7 @@ Deprecated no-ops (now the default behavior):
 
 Examples:
   pr-codex-review 123
-  pr-codex-review 123 -n 8 --model gpt-5.5 --effort high
+  pr-codex-review 123 -n 8 --model gpt-5.4-mini --effort low
   pr-codex-review https://github.com/owner/repo/pull/123 --dry-run
 EOF
 }
@@ -60,8 +60,8 @@ USE_DIRENV=1
 ALLOW_ENVRC_CHANGE=0
 REVIEW_TIMEOUT="45m"
 MIN_SUCCESSFUL=""
-MODEL=""
-EFFORT=""
+MODEL="gpt-5.5"
+EFFORT="medium"
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -84,6 +84,7 @@ while [ "$#" -gt 0 ]; do
       shift
       ;;
     --model)
+      [ "$#" -ge 2 ] || die "--model requires a value"
       MODEL="${2:-}"
       shift 2
       ;;
@@ -92,6 +93,7 @@ while [ "$#" -gt 0 ]; do
       shift
       ;;
     --effort)
+      [ "$#" -ge 2 ] || die "--effort requires a value"
       EFFORT="${2:-}"
       shift 2
       ;;
@@ -181,19 +183,15 @@ done
 [ "$RUNS" -le 12 ] || die "--runs must be <= 12"
 [ "$CONCURRENCY" -ge 1 ] || die "--concurrency must be >= 1"
 [ -z "$MIN_SUCCESSFUL" ] || [ "$MIN_SUCCESSFUL" -ge 1 ] || die "--min-successful must be >= 1"
+case "$MODEL" in
+  ""|-*) die "--model requires a non-empty model name" ;;
+esac
 # Codex silently ignores an unknown effort value instead of failing, so a typo
 # here would waste every reviewer run. Validate before spawning anything.
 case "$EFFORT" in
-  ""|minimal|low|medium|high|xhigh) ;;
+  minimal|low|medium|high|xhigh) ;;
   *) die "--effort must be one of: minimal, low, medium, high, xhigh" ;;
 esac
-
-CODEX_FLAGS=()
-[ -z "$MODEL" ] || CODEX_FLAGS+=(-m "$MODEL")
-[ -z "$EFFORT" ] || CODEX_FLAGS+=(-c "model_reasoning_effort=$EFFORT")
-# Serena brings no value for diff reviews and its per-reviewer server spawns
-# have deadlocked runs before (hung write_memory, duplicate instances).
-CODEX_FLAGS+=(-c "mcp_servers.serena.enabled=false")
 
 duration_to_seconds() {
   local value="$1"
@@ -219,6 +217,15 @@ need codex
 if [ "$USE_DIRENV" -eq 1 ]; then
   need direnv
 fi
+
+MODEL_TOML="$(jq -Rn --arg model "$MODEL" '$model')"
+CODEX_FLAGS=(-m "$MODEL" -c "model_reasoning_effort=$EFFORT")
+# Serena brings no value for diff reviews and its per-reviewer server spawns
+# have deadlocked runs before (hung write_memory, duplicate instances).
+CODEX_FLAGS+=(-c "mcp_servers.serena.enabled=false")
+# Codex has a review-specific model setting that takes precedence over -m.
+# Override both so user/project config cannot silently select another model.
+REVIEW_CODEX_FLAGS=("${CODEX_FLAGS[@]}" -c "review_model=$MODEL_TOML")
 
 C_GREEN=""
 C_RED=""
@@ -325,15 +332,6 @@ if [ "$GC_REMOVED" -gt 0 ]; then
   echo "${C_DIM}gc: removed $GC_REMOVED old run dir(s)${C_RESET}"
 fi
 
-MODEL_DESC="codex default"
-if [ -n "$MODEL" ] && [ -n "$EFFORT" ]; then
-  MODEL_DESC="$MODEL (effort $EFFORT)"
-elif [ -n "$MODEL" ]; then
-  MODEL_DESC="$MODEL"
-elif [ -n "$EFFORT" ]; then
-  MODEL_DESC="codex default (effort $EFFORT)"
-fi
-
 echo "${C_BOLD}pr-codex-review v$VERSION${C_RESET}"
 hr
 row "PR" "${C_BOLD}#$PR_NUMBER $PR_TITLE${C_RESET}"
@@ -343,7 +341,8 @@ row "Base" "$BASE_REF (GitHub reported $INITIAL_BASE_SHA)"
 row "Head" "$INITIAL_HEAD_SHA"
 row "Draft" "$IS_DRAFT"
 row "Reviewers" "$RUNS (concurrency $CONCURRENCY, timeout $REVIEW_TIMEOUT)"
-row "Model" "$MODEL_DESC"
+row "Model" "$MODEL (reviewers + aggregator)"
+row "Effort" "$EFFORT"
 row "Run dir" "$RUN_ROOT"
 hr
 
@@ -428,9 +427,9 @@ run_reviewer() {
 run_codex_review() {
   local out="$1"
   if [ "$USE_DIRENV" -eq 1 ]; then
-    (cd "$WORKTREE" && direnv exec "$WORKTREE" codex exec review ${CODEX_FLAGS[@]+"${CODEX_FLAGS[@]}"} --base "$BASE_REF" --ephemeral -o "$out")
+    (cd "$WORKTREE" && direnv exec "$WORKTREE" codex exec review ${REVIEW_CODEX_FLAGS[@]+"${REVIEW_CODEX_FLAGS[@]}"} --base "$BASE_REF" --ephemeral -o "$out")
   else
-    (cd "$WORKTREE" && codex exec review ${CODEX_FLAGS[@]+"${CODEX_FLAGS[@]}"} --base "$BASE_REF" --ephemeral -o "$out")
+    (cd "$WORKTREE" && codex exec review ${REVIEW_CODEX_FLAGS[@]+"${REVIEW_CODEX_FLAGS[@]}"} --base "$BASE_REF" --ephemeral -o "$out")
   fi
 }
 
