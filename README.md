@@ -52,7 +52,7 @@ This runs 6 reviewers in parallel, aggregates their findings, posts the comment 
 pr-codex-review https://github.com/owner/repo/pull/123
 ```
 
-By default, reviewers and the aggregator use `gpt-5.5` with `medium` reasoning effort, regardless of your personal Codex model and effort defaults.
+By default, reviewers and the aggregator use `gpt-5.6-terra` with `medium` reasoning effort, regardless of your personal Codex model and effort defaults.
 
 Use `--dry-run` to inspect the comment before anything touches GitHub:
 
@@ -88,7 +88,7 @@ Number of Codex reviewer passes. Default: 6.
 Maximum number of reviewer passes running at the same time. Default: same as --runs.
 
 --model MODEL
-Model for the Codex reviewers and the aggregator. Default: gpt-5.5.
+Model for the Codex reviewers and the aggregator. Default: gpt-5.6-terra.
 
 --effort LEVEL
 Reasoning effort for the Codex reviewers and the aggregator.
