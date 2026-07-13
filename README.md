@@ -52,6 +52,8 @@ This runs 6 reviewers in parallel, aggregates their findings, posts the comment 
 pr-codex-review https://github.com/owner/repo/pull/123
 ```
 
+When the run finishes, the command sends an OSC 777 terminal notification. In cmux this marks the pane unread and can show a macOS notification, just like its Codex and Claude Code integrations. Failed runs notify too. Use `--no-notify` to disable this behavior.
+
 By default, reviewers and the aggregator use `gpt-5.6-terra` with `medium` reasoning effort, regardless of your personal Codex model and effort defaults.
 
 Use `--dry-run` to inspect the comment before anything touches GitHub:
@@ -123,6 +125,9 @@ Skip direnv.
 --allow-envrc-change
 Allow automatic direnv allow even when the PR changed `.envrc`.
 Use this only after manually checking the `.envrc` diff.
+
+--no-notify
+Disable the terminal notification sent when the run succeeds or fails.
 
 --version
 Show version.
